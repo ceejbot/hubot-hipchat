@@ -1,174 +1,173 @@
-Robot   = require('hubot').Robot
-Adapter = require('hubot').Adapter
-TextMessage = require('hubot').TextMessage
-HTTPS = require 'https'
-Wobot = require('wobot').Bot
-Log = require('log')
-logger = new Log process.env.HUBOT_LOG_LEVEL or 'info'
+{Adapter, TextMessage, EnterMessage, LeaveMessage} = require "../../hubot"
+HTTPS = require "https"
+{inspect} = require "util"
+Connector = require "./connector"
+promise = require "./promises"
 
 class HipChat extends Adapter
+
+  constructor: (robot) ->
+    super robot
+    @logger = robot.logger
+
   send: (envelope, strings...) ->
-    user = null
-    room = null
-    target_jid = null
+    {user, room} = envelope
+    user = envelope if not user # pre-2.4.2 style
 
-    # as of hubot 2.4.2, the first param to send() is an object with 'user'
-    # and 'room' data inside. detect the old style here.
-    if envelope.reply_to
-      user = envelope
-    else
-      # expand envelope
-      user = envelope.user
-      room = envelope.room
-
-    if user
+    target_jid =
       # most common case - we're replying to a user in a room or 1-1
-      if user.reply_to
-        target_jid = user.reply_to
+      user?.reply_to or
       # allows user objects to be passed in
-      else if user.jid
-        target_jid = user.jid
-      # allows user to be a jid string
-      else if user.search /@/ != -1
-        target_jid = user
-    else if room
-      # this will happen if someone uses robot.messageRoom(jid, ...)
-      target_jid = room
+      user?.jid or
+      if user?.search?(/@/) >= 0
+        user # allows user to be a jid string
+      else
+        room # this will happen if someone uses robot.messageRoom(jid, ...)
 
     if not target_jid
-      logger.error "ERROR: Not sure who to send to. envelope=", envelope
-      return
+      return @logger.error "ERROR: Not sure who to send to: envelope=#{inspect envelope}"
 
     for str in strings
-      @bot.message target_jid, str
+      @connector.message target_jid, str
 
   reply: (envelope, strings...) ->
     user = if envelope.user then envelope.user else envelope
-    for str in strings
-      @send envelope, "@#{user.mention_name} #{str}"
+    @send envelope, "@#{user.mention_name} #{str}" for str in strings
 
   run: ->
-    self = @
     @options =
-      jid:      process.env.HUBOT_HIPCHAT_JID
-      password: process.env.HUBOT_HIPCHAT_PASSWORD
-      token:    process.env.HUBOT_HIPCHAT_TOKEN or null
-      rooms:    process.env.HUBOT_HIPCHAT_ROOMS or "All"
-      debug:    process.env.HUBOT_HIPCHAT_DEBUG or false
-      host:     process.env.HUBOT_HIPCHAT_HOST or null
-    logger.debug "HipChat adapter options:", @options
+      jid:        process.env.HUBOT_HIPCHAT_JID
+      password:   process.env.HUBOT_HIPCHAT_PASSWORD
+      token:      process.env.HUBOT_HIPCHAT_TOKEN or null
+      rooms:      process.env.HUBOT_HIPCHAT_ROOMS or "All"
+      host:       process.env.HUBOT_HIPCHAT_HOST or null
+      autojoin:   process.env.HUBOT_HIPCHAT_JOIN_ROOMS_ON_INVITE isnt "false"
+    @logger.debug "HipChat adapter options: #{JSON.stringify @options}"
 
-    # create Wobot bot object
-    bot = new Wobot(
-      jid: @options.jid,
-      password: @options.password,
-      debug: @options.debug == 'true',
+    # create Connector object
+    connector = new Connector
+      jid: @options.jid
+      password: @options.password
       host: @options.host
-    )
-    logger.debug "Wobot object:", bot
+      logger: @logger
+    host = if @options.host then @options.host else "hipchat.com"
+    @logger.info "Connecting HipChat adapter..."
 
-    bot.onConnect =>
-      logger.info "Connected to HipChat as @#{bot.mention_name}!"
+    init = promise()
+
+    connector.onConnect =>
+      @logger.info "Connected to #{host} as @#{connector.mention_name}"
 
       # Provide our name to Hubot
-      self.robot.name = bot.mention_name
+      @robot.name = connector.mention_name
 
       # Tell Hubot we're connected so it can load scripts
-      self.emit "connected"
-
-      # Join requested rooms
-      if @options.rooms is "All" or @options.rooms is '@All'
-        bot.getRooms (err, rooms, stanza) ->
-          if rooms
-            for room in rooms
-              logger.info "Joining #{room.jid}"
-              bot.join room.jid
-          else
-            logger.error "Can't list rooms: #{err}"
-      else
-        for room_jid in @options.rooms.split(',')
-          logger.info "Joining #{room_jid}"
-          bot.join room_jid
+      @emit "connected"
 
       # Fetch user info
-      bot.getRoster (err, users, stanza) ->
-        if users
+      connector.getRoster (err, users, stanza) =>
+        return init.reject err if err
+        init.resolve users
+
+      init
+        .done (users) =>
+          # Save users to brain
           for user in users
-            self.robot.brain.userForId self.userIdFromJid(user.jid), user
-        else
-          logger.error "Can't list users: #{err}"
+            user.id = @userIdFromJid user.jid
+            @robot.brain.userForId user.id, user
+          # Join requested rooms
+          if @options.rooms is "All" or @options.rooms is "@All"
+            connector.getRooms (err, rooms, stanza) =>
+              if rooms
+                for room in rooms
+                  @logger.info "Joining #{room.jid}"
+                  connector.join room.jid
+              else
+                @logger.error "Can't list rooms: #{errmsg err}"
+          # Join all rooms
+          else
+            for room_jid in @options.rooms.split ","
+              @logger.info "Joining #{room_jid}"
+              connector.join room_jid
+        .fail (err) =>
+          @logger.error "Can't list users: #{errmsg err}" if err
 
-    bot.onError (message) ->
-      # If HipChat sends an error, we get the error message from XMPP.
-      # Otherwise, we get an Error object from the Node connection.
-      if message.message
-        logger.error "Error talking to HipChat:", message.message
-      else
-        logger.error "Received error from HipChat:", message
+      handleMessage = (opts) =>
+        # buffer message events until the roster fetch completes
+        # to ensure user data is properly loaded
+        init.done =>
+          {getAuthor, message, reply_to, room} = opts
+          author = getAuthor()
+          author.reply_to = reply_to
+          author.room = room
+          @receive new TextMessage(author, message)
 
-    bot.onMessage (channel, from, message) ->
-      author = {}
-      author.name = from
-      author.reply_to = channel
-      author.room = self.roomNameFromJid(channel)
+      connector.onMessage (channel, from, message) =>
+        # reformat leading @mention name to be like "name: message" which is
+        # what hubot expects
+        mention_name = connector.mention_name
+        regex = new RegExp "^@#{mention_name}\\b", "i"
+        message = message.replace regex, "#{mention_name}: "
+        handleMessage
+          getAuthor: => @robot.brain.userForName(from)
+          message: message
+          reply_to: channel
+          room: @roomNameFromJid(channel)
 
-      # add extra details if this message is from a known user
-      author_data = self.robot.brain.userForName(from)
-      if author_data
-        author.name = author_data.name
-        author.mention_name = author_data.mention_name
-        author.jid = author_data.jid
+      connector.onPrivateMessage (from, message) =>
+        # remove leading @mention name if present and format the message like
+        # "name: message" which is what hubot expects
+        mention_name = connector.mention_name
+        regex = new RegExp "^@#{mention_name}\\b", "i"
+        message = "#{mention_name}: #{message.replace regex, ""}"
+        handleMessage
+          getAuthor: => @robot.brain.userForId(@userIdFromJid from)
+          message: message
+          reply_to: from
 
-      # reformat leading @mention name to be like "name: message" which is
-      # what hubot expects
-      regex = new RegExp("^@#{bot.mention_name}\\b", "i")
-      hubot_msg = message.replace(regex, "#{bot.mention_name}: ")
+      changePresence = (PresenceMessage, user_jid, room_jid) =>
+        # buffer presence events until the roster fetch completes
+        # to ensure user data is properly loaded
+        init.done =>
+          user = @robot.brain.userForId(@userIdFromJid(user_jid)) or {}
+          if user
+            user.room = room_jid
+            @receive new PresenceMessage(user)
 
-      self.receive new TextMessage(author, hubot_msg)
+      connector.onEnter (user_jid, room_jid) =>
+        changePresence EnterMessage, user_jid, room_jid
 
-    bot.onPrivateMessage (from, message) ->
-      author = {}
-      author.reply_to = from
+      connector.onLeave (user_jid, room_jid) ->
+        changePresence LeaveMessage, user_jid, room_jid
 
-      # add extra details if this message is from a known user
-      author_data = self.robot.brain.userForId(self.userIdFromJid(from))
-      if author_data
-        author.name = author_data.name
-        author.mention_name = author_data.mention_name
-        author.jid = author_data.jid
+      connector.onDisconnect =>
+        @logger.info "Disconnected from #{host}"
 
-      # remove leading @mention name if present and format the message like
-      # "name: message" which is what hubot expects
-      regex = new RegExp("^@#{bot.mention_name}\\b", "i")
-      message = message.replace(regex, "")
-      hubot_msg = "#{bot.mention_name}: #{message}"
+      connector.onError =>
+        @logger.error [].slice.call(arguments).map(inspect).join(", ")
 
-      self.receive new TextMessage(author, hubot_msg)
+      connector.onInvite (room_jid, from_jid, message) =>
+        action = if @options.autojoin then "joining" else "ignoring"
+        @logger.info "Got invite to #{room_jid} from #{from_jid} - #{action}"
+        connector.join room_jid if @options.autojoin
 
-    # Join rooms automatically when invited
-    bot.onInvite (room_jid, from_jid, message) =>
-      logger.info "Got invite to #{room_jid} from #{from_jid} - joining"
-      bot.join room_jid
+    connector.connect()
 
-    bot.connect()
-
-    @bot = bot
+    @connector = connector
 
   userIdFromJid: (jid) ->
     try
-      return jid.match(/^\d+_(\d+)@chat\./)[1]
+      jid.match(/^\d+_(\d+)@chat\./)[1]
     catch e
-      logger.error "Bad user JID: #{jid}"
-      return null
+      @logger.error "Bad user JID: #{jid}"
 
   roomNameFromJid: (jid) ->
     try
-      return jid.match(/^\d+_(.+)@conf\./)[1]
+      jid.match(/^\d+_(.+)@conf\./)[1]
     catch e
-      logger.error "Bad room JID: #{jid}"
-      return null
+      @logger.error "Bad room JID: #{jid}"
 
-  # Convenience HTTP Methods for posting on behalf of the token"d user
+  # Convenience HTTP Methods for posting on behalf of the token'd user
   get: (path, callback) ->
     @request "GET", path, null, callback
 
@@ -176,34 +175,32 @@ class HipChat extends Adapter
     @request "POST", path, body, callback
 
   request: (method, path, body, callback) ->
-    logger.info method, path, body
+    @logger.debug "Request:", method, path, body
     host = @options.host or "api.hipchat.com"
     headers = "Host": host
 
     unless @options.token
-      callback "No API token provided to Hubot", null
-      return
+      return callback "No API token provided to Hubot", null
 
     options =
-      "agent"  : false
-      "host"   : host
-      "port"   : 443
-      "path"   : path += "?auth_token=#{@options.token}"
-      "method" : method
-      "headers": headers
+      agent  : false
+      host   : host
+      port   : 443
+      path   : path += "?auth_token=#{@options.token}"
+      method : method
+      headers: headers
 
     if method is "POST"
       headers["Content-Type"] = "application/x-www-form-urlencoded"
       options.headers["Content-Length"] = body.length
 
-    request = HTTPS.request options, (response) ->
+    request = HTTPS.request options, (response) =>
       data = ""
       response.on "data", (chunk) ->
         data += chunk
-      response.on "end", ->
+      response.on "end", =>
         if response.statusCode >= 400
-          logger.error "HipChat API error: #{response.statusCode}"
-
+          @logger.error "HipChat API error: #{response.statusCode}"
         try
           callback null, JSON.parse(data)
         catch err
@@ -212,14 +209,17 @@ class HipChat extends Adapter
         callback err, null
 
     if method is "POST"
-      request.end(body, 'binary')
+      request.end(body, "binary")
     else
       request.end()
 
-    request.on "error", (err) ->
-      logger.error err
-      logger.error err.stack
+    request.on "error", (err) =>
+      @logger.error err
+      @logger.error err.stack if err.stack
       callback err
+
+errmsg = (err) ->
+  err + (if err.stack then '\n' + err.stack else '')
 
 exports.use = (robot) ->
   new HipChat robot
